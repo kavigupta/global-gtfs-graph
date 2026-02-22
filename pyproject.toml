@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "global-gtfs-graph"
+version = "0.1.0"
+description = "Global GTFS graph processing: feeds, calendars, stops, routes"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "pandas",
+    "permacache",
+    "requests",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+osm = [
+    "urbanstats",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["global_gtfs_graph*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
