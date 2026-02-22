@@ -1,8 +1,7 @@
-import unittest
 import datetime
-from typing import Dict, List
+import unittest
 
-from urbanstats.osm.trains import duplicate_and_shift_calendar
+from global_gtfs_graph import duplicate_and_shift_calendar
 
 
 def parse_date(date_str: str) -> datetime.date:
