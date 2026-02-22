@@ -4,29 +4,93 @@ import io
 import json
 import os
 import zipfile
+from dataclasses import dataclass
+from pathlib import Path
 
-import pandas as pd
 import requests
 from permacache import permacache
 
 from . import gtfs_io
 
-repo = "transitland/transitland-atlas"
-hash = "821069d1a80ee041e29d86ee093c5b71ddcf0da4"
+DEFAULT_DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
 
 
-@permacache("urbanstats/osm/trains/gtfs_list_2", multiprocess_safe=True)
-def gtfs_list():
-    url_api = f"https://api.github.com/repos/{repo}/git/trees/{hash}?recursive=1"
+@dataclass(frozen=True)
+class FeedVersion:
+    """Identifies a version of the feed index (e.g. Transitland Atlas tree)."""
+
+    name: str
+    git_hash: str
+    repo: str = "transitland/transitland-atlas"
+
+    def data_dir(self, base: Path = DEFAULT_DATA_DIR) -> Path:
+        """Directory under data/ where this version's index and specs are stored."""
+        return base / self.name
+
+
+def _feed_paths_file(feed_version: FeedVersion, base: Path = DEFAULT_DATA_DIR) -> Path:
+    return feed_version.data_dir(base) / "feed_paths.json"
+
+
+def _version_file(feed_version: FeedVersion, base: Path = DEFAULT_DATA_DIR) -> Path:
+    return feed_version.data_dir(base) / "version.txt"
+
+
+def gtfs_list(
+    feed_version: FeedVersion,
+    base: Path = DEFAULT_DATA_DIR,
+) -> list[str]:
+    """
+    List feed paths (e.g. feeds/...) for the given FeedVersion.
+    Downloads and caches the list under data/<name>/; reuses cache when version matches.
+    """
+    paths_file = _feed_paths_file(feed_version, base)
+    version_file = _version_file(feed_version, base)
+
+    if paths_file.exists():
+        if version_file.exists() and version_file.read_text().strip() == feed_version.git_hash:
+            return json.loads(paths_file.read_text())
+
+    url_api = (
+        f"https://api.github.com/repos/{feed_version.repo}/git/trees/"
+        f"{feed_version.git_hash}?recursive=1"
+    )
     tree = requests.get(url_api).json()["tree"]
     feeds = [x["path"] for x in tree if x["path"].startswith("feeds/")]
+
+    data_dir = feed_version.data_dir(base)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    version_file.write_text(feed_version.git_hash + "\n")
+    paths_file.write_text(json.dumps(feeds, indent=2))
+
     return feeds
 
 
-@permacache("urbanstats/osm/trains/read_gtfs_spec_2", multiprocess_safe=True)
-def read_gtfs_spec(feed_path):
-    url = f"https://raw.githubusercontent.com/{repo}/{hash}/{feed_path}"
-    return json.loads(requests.get(url).content)
+def read_gtfs_spec(
+    feed_path: str,
+    feed_version: FeedVersion,
+    base: Path = DEFAULT_DATA_DIR,
+) -> dict:
+    """
+    Load the GTFS spec JSON for a feed path. Cached under data/<name>/specs/.
+    """
+    specs_dir = feed_version.data_dir(base) / "specs"
+    safe_name = feed_path.replace("/", "_")
+    spec_file = specs_dir / safe_name
+
+    if spec_file.exists():
+        return json.loads(spec_file.read_text())
+
+    url = (
+        f"https://raw.githubusercontent.com/{feed_version.repo}/"
+        f"{feed_version.git_hash}/{feed_path}"
+    )
+    spec = requests.get(url).json()
+
+    specs_dir.mkdir(parents=True, exist_ok=True)
+    spec_file.write_text(json.dumps(spec, indent=2))
+
+    return spec
 
 
 def api_key():
@@ -79,12 +143,15 @@ def read_gtfs_from_feed_id(feed_id):
     }
 
 
-def all_gtfs_info():
+def all_gtfs_info(
+    feed_version: FeedVersion,
+    base: Path = DEFAULT_DATA_DIR,
+):
     import tqdm.auto as tqdm
 
-    urls = gtfs_list()
+    urls = gtfs_list(feed_version=feed_version, base=base)
     for url in tqdm.tqdm(urls):
-        spec = read_gtfs_spec(url)
+        spec = read_gtfs_spec(url, feed_version=feed_version, base=base)
         for feed in spec["feeds"]:
             yield dict(
                 feed=feed,
@@ -92,10 +159,12 @@ def all_gtfs_info():
             )
 
 
-@permacache("urbanstats/osm/trains/all_failures")
-def all_failures():
+def all_failures(
+    feed_version: FeedVersion,
+    base: Path = DEFAULT_DATA_DIR,
+):
     bad_feeds = []
-    for res in all_gtfs_info():
+    for res in all_gtfs_info(feed_version=feed_version, base=base):
         gtfs = res["gtfs_result"]()
         if gtfs["status"] == "failure":
             bad_feeds.append((res["feed"], gtfs["reason"]))

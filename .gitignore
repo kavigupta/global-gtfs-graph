@@ -39,6 +39,9 @@ dmypy.json
 # Jupyter
 .ipynb_checkpoints/
 
+# Downloaded feed index/specs
+data/
+
 # OS
 .DS_Store
 Thumbs.db
