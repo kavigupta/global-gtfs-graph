@@ -19,9 +19,9 @@ def pull_file_from_gtfs(gtfs, filename):
 def read_try_multiple_encodings(file):
     try:
         try:
-            return pd.read_csv(file())
+            return pd.read_csv(file(), low_memory=False)
         except UnicodeDecodeError:
-            return pd.read_csv(file(), encoding="latin1")
+            return pd.read_csv(file(), encoding="latin1", low_memory=False)
     except pd.errors.EmptyDataError:
         return pd.DataFrame()
     except pd.errors.ParserError:
