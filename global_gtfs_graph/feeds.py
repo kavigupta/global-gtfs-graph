@@ -3,12 +3,12 @@
 import io
 import json
 import os
+import re
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
 import requests
-from permacache import permacache
 
 from . import gtfs_io
 
@@ -99,10 +99,24 @@ def api_key():
     return api_key
 
 
-@permacache(
-    "urbanstats/osm/trains/read_gtfs_from_feed_id_raw_5", multiprocess_safe=True
-)
-def read_gtfs_from_feed_id_raw(feed_id):
+def _feed_zip_path(feed_id: str, base: Path = DEFAULT_DATA_DIR) -> Path:
+    """Cache path for a feed's raw zip. feed_id is sanitized for use as a filename."""
+    safe = re.sub(r"[^\w\-.]", "_", feed_id)
+    return base / "feeds" / f"{safe}.zip"
+
+
+def read_gtfs_from_feed_id_raw(
+    feed_id: str,
+    base: Path = DEFAULT_DATA_DIR,
+) -> dict:
+    """
+    Download raw GTFS zip for a Transitland feed_id. Cached under data/feeds/<feed_id>.zip.
+    """
+    zip_path = _feed_zip_path(feed_id, base)
+
+    if zip_path.exists():
+        return {"status": "success", "content": zip_path.read_bytes()}
+
     try:
         result = requests.get(
             f"https://transit.land/api/v2/rest/feeds/{feed_id}/download_latest_feed_version",
@@ -113,6 +127,8 @@ def read_gtfs_from_feed_id_raw(feed_id):
                 "status": "failure",
                 "reason": f"status code {result.status_code}; content: {result.content}",
             }
+        zip_path.parent.mkdir(parents=True, exist_ok=True)
+        zip_path.write_bytes(result.content)
         return {"status": "success", "content": result.content}
     except requests.exceptions.Timeout:
         return {"status": "failure", "reason": "timeout"}
@@ -124,20 +140,26 @@ def read_gtfs_from_feed_id_raw(feed_id):
         return {"status": "failure", "reason": "chunked encoding error"}
 
 
-@permacache("urbanstats/osm/trains/read_gtfs_from_feed_id_4", multiprocess_safe=True)
-def read_gtfs_from_feed_id(feed_id):
-    res = read_gtfs_from_feed_id_raw(feed_id)
+def read_gtfs_from_feed_id(
+    feed_id: str,
+    base: Path = DEFAULT_DATA_DIR,
+) -> dict:
+    """
+    Load GTFS feed by Transitland feed_id; returns parsed CSV contents as DataFrames.
+    Raw zip is cached under data/feeds/<feed_id>.zip.
+    """
+    res = read_gtfs_from_feed_id_raw(feed_id, base=base)
     if res["status"] == "failure":
         return res
     zip_buf = io.BytesIO(res["content"])
     try:
         zip_file = zipfile.ZipFile(zip_buf)
-    except zipfile.BadZipFile as e:
+    except zipfile.BadZipFile:
         return {"status": "failure", "reason": "bad zip file"}
     return {
         "status": "success",
         "content": {
-            name: gtfs_io.read_try_multiple_encodings(lambda: zip_file.open(name))
+            name: gtfs_io.read_try_multiple_encodings(lambda n=name: zip_file.open(n))
             for name in zip_file.namelist()
         },
     }
@@ -155,7 +177,9 @@ def all_gtfs_info(
         for feed in spec["feeds"]:
             yield dict(
                 feed=feed,
-                gtfs_result=lambda feed=feed: read_gtfs_from_feed_id(feed["id"]),
+                gtfs_result=lambda feed=feed, base=base: read_gtfs_from_feed_id(
+                    feed["id"], base=base
+                ),
             )
 
 

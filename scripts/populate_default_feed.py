@@ -1,5 +1,5 @@
 """
-Populate cached feed index and specs for the default feed version.
+Populate cached feed index, specs, and downloaded feed zips for the default feed version.
 Run from repo root: python -m scripts.populate_default_feed
 """
 
@@ -7,7 +7,12 @@ from pathlib import Path
 
 import tqdm
 
-from global_gtfs_graph.feeds import FeedVersion, gtfs_list, read_gtfs_spec
+from global_gtfs_graph.feeds import (
+    FeedVersion,
+    all_gtfs_info,
+    gtfs_list,
+    read_gtfs_spec,
+)
 
 DEFAULT_FEED_VERSION = FeedVersion(
     name="2026-02-22",
@@ -20,7 +25,14 @@ def main():
     paths = gtfs_list(feed_version=DEFAULT_FEED_VERSION, base=base)
     for path in tqdm.tqdm(paths, desc="Fetching specs"):
         read_gtfs_spec(path, feed_version=DEFAULT_FEED_VERSION, base=base)
-    print(f"Populated {len(paths)} feed specs for {DEFAULT_FEED_VERSION.name}")
+
+    count = 0
+    for gtfs_info in all_gtfs_info(feed_version=DEFAULT_FEED_VERSION, base=base):
+        gtfs_info["gtfs_result"]()
+        count += 1
+    print(
+        f"Populated {len(paths)} feed specs and {count} feed zips for {DEFAULT_FEED_VERSION.name}"
+    )
 
 
 if __name__ == "__main__":
