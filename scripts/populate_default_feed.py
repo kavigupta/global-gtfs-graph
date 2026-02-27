@@ -7,6 +7,7 @@ from pathlib import Path
 
 import tqdm
 
+from global_gtfs_graph.calendar import standardize_calendars
 from global_gtfs_graph.feeds import (
     FeedVersion,
     all_gtfs_info,
@@ -26,12 +27,13 @@ def main():
     for path in tqdm.tqdm(paths, desc="Fetching specs"):
         read_gtfs_spec(path, feed_version=DEFAULT_FEED_VERSION, base=base)
 
-    count = 0
-    for gtfs_info in all_gtfs_info(feed_version=DEFAULT_FEED_VERSION, base=base):
-        gtfs_info["gtfs_result"]()
-        count += 1
+    services, start_common, end_common = standardize_calendars(
+        feed_version=DEFAULT_FEED_VERSION, base=base
+    )
+    n_days = len(next(iter(services.values()), [])) if services else 0
     print(
-        f"Populated {len(paths)} feed specs and {count} feed zips for {DEFAULT_FEED_VERSION.name}"
+        f"Standardized calendars: {len(services)} agencies, "
+        f"common window {start_common}–{end_common} ({n_days} days)"
     )
 
 

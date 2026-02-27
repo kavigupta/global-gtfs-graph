@@ -1,17 +1,27 @@
-"""GTFS calendar and service date handling."""
+"""GTFS calendar and service date handling.
+
+Per-feed calendar (service_id -> active dates) is cached under data/calendars/<feed_id>.json.
+standardize_calendars() aligns all feeds to a common date window; result cached under
+data/calendars/standardized_<feed_version.name>.json. Service IDs are kept as raw strings
+(no integer ID standardization).
+"""
 
 import datetime
+import json
 from bisect import bisect_right
 from collections import defaultdict
+from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
+import re
 import tqdm.auto as tqdm
-from permacache import permacache
 
 from . import feeds
 from . import gtfs_io
+
+DEFAULT_DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
 
 
 def parse_date(date_str: str, default: datetime.date = None) -> Optional[datetime.date]:
@@ -75,10 +85,39 @@ def calendar_dates_to_calendar_txt(exceptions_table) -> pd.DataFrame:
     return pivot / num_days * 7
 
 
-def joined_calendar_dates(gtfs) -> Dict[str, Set[datetime.date]]:
+def _calendar_cache_path(feed_id: str, base: Path = DEFAULT_DATA_DIR) -> Path:
+    safe = re.sub(r"[^\w\-.]", "_", feed_id)
+    return base / "calendars" / f"{safe}.json"
+
+
+def _serialize_joined_calendar(active_dates: Dict[str, Set[datetime.date]]) -> dict:
+    return {
+        str(sid): sorted(d.isoformat() for d in dates)
+        for sid, dates in active_dates.items()
+    }
+
+
+def _deserialize_joined_calendar(data: dict) -> Dict[str, Set[datetime.date]]:
+    return {
+        sid: {datetime.date.fromisoformat(s) for s in dates}
+        for sid, dates in data.items()
+    }
+
+
+def joined_calendar_dates(
+    gtfs,
+    feed_id: Optional[str] = None,
+    base: Path = DEFAULT_DATA_DIR,
+) -> Dict[str, Set[datetime.date]]:
     """
-    Returns a map of feed IDs to their active dates.
+    Returns service_id -> set of active dates for this feed.
+    If feed_id and base are provided, reads/writes cache from data/calendars/<feed_id>.json.
     """
+    if feed_id is not None:
+        cache_path = _calendar_cache_path(feed_id, base)
+        if cache_path.exists():
+            return _deserialize_joined_calendar(json.loads(cache_path.read_text()))
+
     calendar = gtfs_io.pull_file_from_gtfs(gtfs, "calendar.txt")
     calendar_dates = gtfs_io.pull_file_from_gtfs(gtfs, "calendar_dates.txt")
 
@@ -95,7 +134,7 @@ def joined_calendar_dates(gtfs) -> Dict[str, Set[datetime.date]]:
             | (calendar.sunday == 1)
         ]
         for _, row in calendar.iterrows():
-            active_dates[row["service_id"]] = process_calendar_row(row)
+            active_dates[str(row["service_id"])] = process_calendar_row(row)
 
     if calendar_dates is not None:
         calendar_dates.date = calendar_dates.date.apply(parse_date)
@@ -106,13 +145,21 @@ def joined_calendar_dates(gtfs) -> Dict[str, Set[datetime.date]]:
         ):
             if date is None:
                 continue
+            sid = str(service_id)
             if exc == 1:
-                active_dates[service_id].add(date)
+                active_dates[sid].add(date)
             elif exc == 2:
-                active_dates[service_id].discard(date)
+                active_dates.setdefault(sid, set()).discard(date)
             else:
                 raise ValueError(f"Unknown exception_type: {exc}")
-    assert active_dates, "No active dates found in GTFS data."
+    if not active_dates:
+        return dict(active_dates)
+
+    if feed_id is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(
+            json.dumps(_serialize_joined_calendar(active_dates), indent=2)
+        )
     return active_dates
 
 
@@ -214,14 +261,38 @@ def duplicate_and_shift_calendar(
         ]
 
 
-@permacache("urbanstats/osm/trains/standardize_calendars_3", multiprocess_safe=True)
-def standardize_calendars():
+def _standardized_calendar_cache_path(
+    feed_version: "feeds.FeedVersion", base: Path = DEFAULT_DATA_DIR
+) -> Path:
+    safe = re.sub(r"[^\w\-.]", "_", feed_version.name)
+    return base / "calendars" / f"standardized_{safe}.json"
+
+
+def standardize_calendars(
+    feed_version: "feeds.FeedVersion",
+    base: Path = DEFAULT_DATA_DIR,
+) -> Tuple[Dict[str, List[Set[str]]], Optional[datetime.date], Optional[datetime.date]]:
+    """
+    Align all feeds to a common 27-day window. Returns (services, start_common, end_common)
+    where services is agency_id -> list of sets of service_id (one set per day in common window).
+    Service IDs are raw strings; no integer ID mapping.
+    Cached under data/calendars/standardized_<feed_version.name>.json.
+    """
+    cache_path = _standardized_calendar_cache_path(feed_version, base)
+    if cache_path.exists():
+        data = json.loads(cache_path.read_text())
+        start_common = datetime.date.fromisoformat(data["start_common"])
+        end_common = datetime.date.fromisoformat(data["end_common"])
+        services = {k: [set(s) for s in v] for k, v in data["services"].items()}
+        return services, start_common, end_common
+
     dates = {}
-    for res in feeds.all_gtfs_info():
+    for res in feeds.all_gtfs_info(feed_version=feed_version, base=base):
         r = res["gtfs_result"]()
         if r["status"] == "failure":
             continue
-        dates[res["feed"]["id"]] = joined_calendar_dates(r["content"])
+        feed_id = res["feed"]["id"]
+        dates[feed_id] = joined_calendar_dates(r["content"], feed_id=feed_id, base=base)
     time_extrema = {k: date_range_from_joined_calendar(x) for k, x in dates.items()}
     time_extrema = {k: x for k, x in time_extrema.items() if x[0] is not None}
     _, start_common, end_common = most_covered_period_of_length(
@@ -233,36 +304,22 @@ def standardize_calendars():
     }
     date_remap = {k: v for k, v in date_remap.items() if v is not None}
     services = {}
-    for k in tqdm.tqdm(date_remap):
+    for k in tqdm.tqdm(date_remap, desc="Standardize calendars"):
         reversed_calendar = reverse_joined_calendar(dates[k])
         services[k] = [reversed_calendar[x] for x in date_remap[k]]
-    day_to_standardized_service_ids, agency_mappings = standardize_service_ids(
-        services
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(
+        json.dumps(
+            {
+                "start_common": start_common.isoformat(),
+                "end_common": end_common.isoformat(),
+                "services": {
+                    str(agency): [sorted(str(x) for x in s) for s in day_sets]
+                    for agency, day_sets in services.items()
+                },
+            },
+            indent=2,
+        )
     )
-    return day_to_standardized_service_ids, agency_mappings, start_common, end_common
-
-
-def standardize_service_ids(
-    services: Dict[str, List[Set[str]]],
-) -> Tuple[List[Set[int]], Dict[str, Dict[str, int]]]:
-    """
-    Given a dict mapping agency id to list of sets of service IDs (one set per day),
-    standardizes the service IDs across agencies.
-    """
-    standardized_service_id = 0
-    agency_mappings: Dict[str, Dict[str, int]] = {}
-    day_to_standardized_service_ids: List[Set[int]] = []
-
-    for agency_id, agency_services in services.items():
-        service_id_mapping: Dict[str, int] = {}
-        for day_services in agency_services:
-            standardized_ids_for_day: Set[int] = set()
-            for service_id in sorted(day_services, key=repr):
-                if service_id not in service_id_mapping:
-                    service_id_mapping[service_id] = standardized_service_id
-                    standardized_service_id += 1
-                standardized_ids_for_day.add(service_id_mapping[service_id])
-            day_to_standardized_service_ids.append(standardized_ids_for_day)
-        agency_mappings[agency_id] = service_id_mapping
-
-    return day_to_standardized_service_ids, agency_mappings
+    return services, start_common, end_common

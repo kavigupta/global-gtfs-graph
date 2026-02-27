@@ -12,7 +12,6 @@ from .calendar import (
     joined_calendar_dates,
     parse_date,
     standardize_calendars,
-    standardize_service_ids,
 )
 from .feeds import (
     FeedVersion,
