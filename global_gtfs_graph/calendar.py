@@ -273,7 +273,7 @@ def standardize_calendars(
     base: Path = DEFAULT_DATA_DIR,
 ) -> Tuple[Dict[str, List[Set[str]]], Optional[datetime.date], Optional[datetime.date]]:
     """
-    Align all feeds to a common 27-day window. Returns (services, start_common, end_common)
+    Align all feeds to a common 1-week (7-day) window. Returns (services, start_common, end_common)
     where services is agency_id -> list of sets of service_id (one set per day in common window).
     Service IDs are raw strings; no integer ID mapping.
     Cached under data/calendars/standardized_<feed_version.name>.json.
@@ -295,8 +295,11 @@ def standardize_calendars(
         dates[feed_id] = joined_calendar_dates(r["content"], feed_id=feed_id, base=base)
     time_extrema = {k: date_range_from_joined_calendar(x) for k, x in dates.items()}
     time_extrema = {k: x for k, x in time_extrema.items() if x[0] is not None}
+    # most_covered_period_of_length treats `length` as (end - start), and downstream code
+    # interprets the common window as inclusive of both endpoints. For a 7-day inclusive
+    # window, we need (end - start) == 6 days.
     _, start_common, end_common = most_covered_period_of_length(
-        list(time_extrema.values()), datetime.timedelta(days=27)
+        list(time_extrema.values()), datetime.timedelta(days=6)
     )
     date_remap = {
         k: duplicate_and_shift_calendar(start, end, start_common, end_common)

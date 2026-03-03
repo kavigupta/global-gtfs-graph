@@ -12,6 +12,7 @@ dependencies = [
     "numpy",
     "pandas",
     "permacache",
+    "protobuf",
     "requests",
     "tqdm",
 ]
@@ -19,6 +20,12 @@ dependencies = [
 [project.optional-dependencies]
 osm = [
     "urbanstats",
+]
+plot = [
+    "matplotlib",
+]
+shapefile = [
+    "geopandas",
 ]
 
 [tool.setuptools.packages.find]

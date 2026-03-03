@@ -8,6 +8,7 @@ from pathlib import Path
 import tqdm
 
 from global_gtfs_graph.calendar import standardize_calendars
+from global_gtfs_graph.feed_graph import write_feed_graph
 from global_gtfs_graph.feeds import (
     FeedVersion,
     all_gtfs_info,
@@ -35,6 +36,18 @@ def main():
         f"Standardized calendars: {len(services)} agencies, "
         f"common window {start_common}–{end_common} ({n_days} days)"
     )
+
+    graph_count = 0
+    for gtfs_info in tqdm.tqdm(
+        all_gtfs_info(feed_version=DEFAULT_FEED_VERSION, base=base),
+        desc="Writing graph files",
+    ):
+        r = gtfs_info["gtfs_result"]()
+        if r["status"] != "success":
+            continue
+        write_feed_graph(r["content"], feed_id=gtfs_info["feed"]["id"], base=base)
+        graph_count += 1
+    print(f"Wrote {graph_count} feed graph files to data/graphs/")
 
 
 if __name__ == "__main__":

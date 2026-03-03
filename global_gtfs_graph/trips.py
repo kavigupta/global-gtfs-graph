@@ -2,15 +2,18 @@
 
 Times are standardized as minutes from midnight within a day. For the multigraph,
 edges use minutes from week start (Monday 00:00): use minutes_from_week_start().
+With timezone support, local times are converted to UTC and wrapped into [0, 10079].
 """
 
 import datetime
 from collections import defaultdict
 from typing import List, Tuple
+from zoneinfo import ZoneInfo
 
 from . import gtfs_io
 
-MINUTES_PER_DAY = 24 * 60 
+MINUTES_PER_DAY = 24 * 60
+MINUTES_PER_WEEK = 7 * MINUTES_PER_DAY  # 10080
 
 
 def parse_time(time_str: str) -> datetime.timedelta:
@@ -18,13 +21,16 @@ def parse_time(time_str: str) -> datetime.timedelta:
     Parses a time string in HH:MM:SS format and returns timedelta since midnight.
     Handles times that exceed 24 hours (e.g. 25:00:00).
     """
-    assert isinstance(time_str, str), f"Expected string, got {type(time_str)}"
+    if not isinstance(time_str, str):
+        time_str = str(time_str).strip()
+    if not time_str or time_str.lower() in ("nan", "nat", ""):
+        raise ValueError(f"Invalid time: {time_str!r}")
     h, m, s = map(int, time_str.split(":"))
     return datetime.timedelta(hours=h, minutes=m, seconds=s)
 
 
 def time_to_minutes_from_midnight(time_str: str) -> int:
-    """Convert GTFS time string (HH:MM:SS) to minutes since midnight"""
+    """Convert GTFS time string (HH:MM:SS) to minutes since midnight. Raises on invalid/NaN."""
     td = parse_time(time_str)
     total_seconds = td.total_seconds()
     return int(total_seconds // 60)
@@ -37,6 +43,28 @@ def minutes_from_week_start(day_of_week: int, minutes_from_midnight: int) -> int
     Monday 00:00 -> 0, Tuesday 00:00 -> 1440, ..., Sunday 23:59 -> 10079.
     """
     return day_of_week * MINUTES_PER_DAY + minutes_from_midnight
+
+
+def local_minutes_to_week_minutes_utc(
+    date: datetime.date,
+    minutes_from_midnight_local: int,
+    timezone_name: str,
+) -> int:
+    """
+    Convert (date, minutes from midnight) in the given timezone to minutes from week start (Monday 00:00) in UTC.
+    Result is wrapped into [0, MINUTES_PER_WEEK) so times that span the week boundary are normalized.
+    """
+    try:
+        tz = ZoneInfo(timezone_name)
+    except Exception:
+        tz = datetime.timezone.utc
+    local_dt = datetime.datetime(
+        date.year, date.month, date.day, tzinfo=tz
+    ) + datetime.timedelta(minutes=minutes_from_midnight_local)
+    utc_dt = local_dt.astimezone(datetime.timezone.utc)
+    weekday = utc_dt.weekday()
+    minutes_from_midnight_utc = utc_dt.hour * 60 + utc_dt.minute
+    return (minutes_from_week_start(weekday, minutes_from_midnight_utc)) % MINUTES_PER_WEEK
 
 
 def compute_trip_stop_times(gtfs) -> List[Tuple[str, str, List[Tuple[str, int]]]]:
@@ -59,10 +87,13 @@ def compute_trip_stop_times(gtfs) -> List[Tuple[str, str, List[Tuple[str, int]]]
         stop_times_df["departure_time"],
         stop_times_df["stop_id"],
     ):
-        start_min = time_to_minutes_from_midnight(arrival_time)
-        end_min = time_to_minutes_from_midnight(departure_time)
+        try:
+            start_min = time_to_minutes_from_midnight(arrival_time)
+            end_min = time_to_minutes_from_midnight(departure_time)
+        except (ValueError, TypeError):
+            continue
         minutes_from_midnight = (start_min + end_min) // 2
-        trip_stop_times[trip_id].append((minutes_from_midnight, stop_id))
+        trip_stop_times[trip_id].append((minutes_from_midnight, str(stop_id)))
 
     trip_id_to_service_id: dict[str, str] = {}
     trips_df = gtfs_io.pull_file_from_gtfs(gtfs, "trips.txt")

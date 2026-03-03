@@ -2,6 +2,7 @@
 
 from . import calendar
 from . import feeds
+from . import feed_graph
 from . import gtfs_io
 from . import routes
 from . import stops
@@ -23,6 +24,7 @@ from .feeds import (
 )
 from .stops import all_stops, collect_stops, pull_stops_for_gtfs, standardized_stops
 from .routes import is_bus_or_ferry_route_type, is_route_type, valid_routes, valid_trips
+from .feed_graph import build_feed_graph, write_feed_graph
 from .trips import (
     MINUTES_PER_DAY,
     compute_trip_stop_times,
