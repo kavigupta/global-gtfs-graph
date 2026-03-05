@@ -165,22 +165,51 @@ def build_feed_graph(
         if len(valid_stops) < 2:
             continue
 
-        start_int, start_mm = valid_stops[0]
-        end_int, end_mm = valid_stops[-1]
-        tz_name = trip_to_tz.get(str(trip_id), "UTC")
-        for wd in weekdays:
-            rep = rep_date.get((str(service_id), wd))
-            if rep is None:
+        for (start_int, start_mm), (end_int, end_mm) in zip(valid_stops, valid_stops[1:]):
+
+            tz_name = trip_to_tz.get(str(trip_id), "UTC")
+            for wd in weekdays:
+                rep = rep_date.get((str(service_id), wd))
+                if rep is None:
+                    continue
+                start_min = trips.local_minutes_to_week_minutes_utc(rep, start_mm, tz_name)
+                end_min = trips.local_minutes_to_week_minutes_utc(rep, end_mm, tz_name)
+                journey_list.append({
+                    "line_id": line_int,
+                    "start_min": start_min,
+                    "end_min": end_min,
+                    "start_stop_id": start_int,
+                    "end_stop_id": end_int,
+                })
+
+    # Compact stops: keep only those that are referenced by at least one journey, and
+    # renumber stop_id to be dense 0..N-1. Journeys are updated to use the new IDs.
+    used_stop_ids = set()
+    for j in journey_list:
+        used_stop_ids.add(int(j["start_stop_id"]))
+        used_stop_ids.add(int(j["end_stop_id"]))
+
+    if used_stop_ids:
+        old_to_new: Dict[int, int] = {}
+        new_stops: List[Dict[str, Any]] = []
+        next_stop_id = 0
+        for s in stop_list:
+            sid = int(s["stop_id"])
+            if sid not in used_stop_ids:
                 continue
-            start_min = trips.local_minutes_to_week_minutes_utc(rep, start_mm, tz_name)
-            end_min = trips.local_minutes_to_week_minutes_utc(rep, end_mm, tz_name)
-            journey_list.append({
-                "line_id": line_int,
-                "start_min": start_min,
-                "end_min": end_min,
-                "start_stop_id": start_int,
-                "end_stop_id": end_int,
-            })
+            old_to_new[sid] = next_stop_id
+            s_new = dict(s)
+            s_new["stop_id"] = next_stop_id
+            new_stops.append(s_new)
+            next_stop_id += 1
+
+        stop_list = new_stops
+        for j in journey_list:
+            j["start_stop_id"] = old_to_new[int(j["start_stop_id"])]
+            j["end_stop_id"] = old_to_new[int(j["end_stop_id"])]
+    else:
+        # No journeys: drop all stops as well.
+        stop_list = []
 
     return {"stops": stop_list, "lines": line_list, "journeys": journey_list}
 
