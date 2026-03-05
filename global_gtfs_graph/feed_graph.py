@@ -17,11 +17,17 @@ from . import graph_pb2
 DEFAULT_DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
 
 
-def _safe_float(x: Any) -> float:
+def _safe_float(x: Any):
+    """
+    Parse a coordinate; return None if invalid instead of coercing to 0.0.
+    """
     try:
-        return float(x)
+        v = float(x)
     except (TypeError, ValueError):
-        return 0.0
+        return None
+    if v != v:  # NaN check
+        return None
+    return v
 
 
 def _safe_feed_basename(feed_id: str) -> str:
@@ -46,18 +52,23 @@ def build_feed_graph(
     stop_list: List[Dict[str, Any]] = []
     gtfs_stop_id_to_int: Dict[str, int] = {}
     if stops_df is not None:
-        for idx, (_, row) in enumerate(stops_df.iterrows()):
+        next_stop_id = 0
+        for _, row in stops_df.iterrows():
             lat = _safe_float(row.get("stop_lat"))
             lon = _safe_float(row.get("stop_lon"))
+            if lat is None or lon is None:
+                # Drop stops with invalid coordinates entirely; they won't appear in the graph.
+                continue
             name = str(row.get("stop_name", "") or "")
             gtfs_id = str(row["stop_id"])
-            gtfs_stop_id_to_int[gtfs_id] = idx
+            gtfs_stop_id_to_int[gtfs_id] = next_stop_id
             stop_list.append({
-                "stop_id": idx,
+                "stop_id": next_stop_id,
                 "name": name,
                 "lat": lat,
                 "lon": lon,
             })
+            next_stop_id += 1
 
     # (2) Lines: normalized int line_id (0..N-1), name, color, type_id, agency_id
     routes_df = gtfs_io.pull_file_from_gtfs(gtfs, "routes.txt")

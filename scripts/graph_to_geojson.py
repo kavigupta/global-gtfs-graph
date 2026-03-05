@@ -12,8 +12,9 @@ Connected components (the `component` field) are read from data/connected_compon
 which is produced by scripts/combine_graphs.py.
 
 Usage (from repo root):
-    python scripts/graph_to_geojson.py            # uses data/ as base
-    python scripts/graph_to_geojson.py data/alt   # optional base data directory
+    python scripts/graph_to_geojson.py                        # all feeds, per-component zips
+    python scripts/graph_to_geojson.py data/                  # optional base data directory
+    python scripts/graph_to_geojson.py data/graphs/foo.pb     # single graph -> foo_points.zip, foo_lines.zip
 
 Requires: pip install geopandas (or pip install global-gtfs-graph[shapefile])
 """
@@ -52,13 +53,98 @@ def _default_data_dir() -> Path:
     return Path(__file__).resolve().parent.parent / "data"
 
 
+def _load_graph(path: Path) -> dict:
+    """Load graph from .pb or .json; return dict with stops, lines, edges (and journeys if present)."""
+    if path.suffix.lower() == ".pb":
+        pb = graph_pb2.FeedGraph()
+        pb.ParseFromString(path.read_bytes())
+        stops = [{"stop_id": s.stop_id, "name": s.name or "", "lat": s.lat, "lon": s.lon} for s in pb.stops]
+        lines = [{"line_id": ln.line_id, "agency_id": getattr(ln, "agency_id", "") or ""} for ln in pb.lines]
+        edges = [
+            {
+                "start_stop_id": e.start_stop_id,
+                "end_stop_id": e.end_stop_id,
+                "line_id": e.line_id,
+            }
+            for e in pb.edges
+        ]
+        return {"stops": stops, "lines": lines, "edges": edges}
+    data = json.loads(path.read_text())
+    assert "stops" in data
+    edges = data.get("edges")
+    if edges is None and "journeys" in data:
+        seen = set()
+        edges = []
+        for j in data["journeys"]:
+            sid, eid = j["start_stop_id"], j["end_stop_id"]
+            lid = j.get("line_id", "")
+            if sid != eid and (sid, eid, lid) not in seen:
+                seen.add((sid, eid, lid))
+                edges.append({"start_stop_id": sid, "end_stop_id": eid, "line_id": lid})
+    return {"stops": data["stops"], "lines": data.get("lines", []), "edges": edges or []}
+
+
+def _write_single_feed_shapefiles(data: dict, feed_id: str, out_dir: Path) -> None:
+    """Write <feed_id>_points.zip and <feed_id>_lines.zip for one graph dict."""
+    stops = data["stops"]
+    lines = data.get("lines", [])
+    edges = data.get("edges", [])
+    line_id_to_agency = {ln["line_id"]: (ln.get("agency_id") or "") for ln in lines}
+    stop_id_to_coords = {s["stop_id"]: (float(s["lon"]), float(s["lat"])) for s in stops}
+
+    if stops:
+        gdf_pts = gpd.GeoDataFrame(
+            {"stop_id": [s["stop_id"] for s in stops], "name": [s.get("name") or "" for s in stops]},
+            geometry=[Point(float(s["lon"]), float(s["lat"])) for s in stops],
+            crs="EPSG:4326",
+        )
+        points_shp = out_dir / f"{feed_id}_points.shp"
+        gdf_pts.to_file(points_shp, driver="ESRI Shapefile")
+        _zip_shapefile(points_shp, out_dir / f"{feed_id}_points.zip")
+        print(f"Wrote {out_dir / f'{feed_id}_points.zip'} ({len(stops)} points)")
+
+    agency_segments = {}
+    for e in edges:
+        c1 = stop_id_to_coords.get(e["start_stop_id"])
+        c2 = stop_id_to_coords.get(e["end_stop_id"])
+        if c1 is None or c2 is None:
+            continue
+        aid = line_id_to_agency.get(e.get("line_id"), "") or ""
+        agency_segments.setdefault(aid, []).append((c1, c2))
+    if agency_segments:
+        multilinestrings = [MultiLineString([LineString([c1, c2]) for c1, c2 in segs]) for segs in [agency_segments[a] for a in sorted(agency_segments)]]
+        gdf_lines = gpd.GeoDataFrame(
+            {"agency_id": sorted(agency_segments)},
+            geometry=multilinestrings,
+            crs="EPSG:4326",
+        )
+        lines_shp = out_dir / f"{feed_id}_lines.shp"
+        gdf_lines.to_file(lines_shp, driver="ESRI Shapefile")
+        _zip_shapefile(lines_shp, out_dir / f"{feed_id}_lines.zip")
+        print(f"Wrote {out_dir / f'{feed_id}_lines.zip'} ({len(agency_segments)} agencies)")
+
+
 def main():
     if len(sys.argv) > 2:
-        print("Usage: python scripts/graph_to_geojson.py [data-dir]", file=sys.stderr)
+        print("Usage: python scripts/graph_to_geojson.py [data-dir | path-to-graph.pb]", file=sys.stderr)
         sys.exit(1)
 
-    base = _default_data_dir() if len(sys.argv) == 1 else Path(sys.argv[1])
-    if not base.exists():
+    arg = Path(sys.argv[1]) if len(sys.argv) == 2 else None
+    if arg is not None and arg.is_file():
+        # Single graph file
+        path = arg
+        if path.suffix.lower() not in (".pb", ".json"):
+            print("Single-file input must be a .pb or .json graph.", file=sys.stderr)
+            sys.exit(1)
+        base = path.parent.parent if path.parent.name == "graphs" else path.parent
+        out_dir = base / "geojson"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        data = _load_graph(path)
+        _write_single_feed_shapefiles(data, path.stem, out_dir)
+        return
+
+    base = _default_data_dir() if arg is None else arg
+    if not base.is_dir() or not base.exists():
         print(f"Data directory not found: {base}", file=sys.stderr)
         sys.exit(1)
 
