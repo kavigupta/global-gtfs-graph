@@ -59,6 +59,9 @@ def build_feed_graph(
             if lat is None or lon is None:
                 # Drop stops with invalid coordinates entirely; they won't appear in the graph.
                 continue
+            # Treat exact (0, 0) coordinates as invalid (common placeholder for missing location).
+            if lat == 0.0 and lon == 0.0:
+                continue
             name = str(row.get("stop_name", "") or "")
             gtfs_id = str(row["stop_id"])
             gtfs_stop_id_to_int[gtfs_id] = next_stop_id
@@ -134,7 +137,9 @@ def build_feed_graph(
                 rep_date[(str(sid), wd)] = d
 
     # (3) Journeys: line_id, start_min, end_min (minutes from week start), int start_stop_id, end_stop_id
-    # (4) Edges: consecutive (start_stop_id, end_stop_id, line_id) with mean_duration_minutes
+    # (4) Edges: consecutive (start_stop_id, end_stop_id, line_id) with mean_duration_minutes.
+    #     When a stop has been dropped earlier (e.g. invalid coordinates), we skip that stop
+    #     but keep the chain by connecting the previous valid stop directly to the next valid one.
     journey_list: List[Dict[str, Any]] = []
     edge_durations: Dict[tuple, List[float]] = {}
     for trip_id, service_id, stop_times in trips.compute_trip_stop_times(gtfs):
@@ -146,23 +151,28 @@ def build_feed_graph(
         weekdays = service_weekdays.get(str(service_id))
         if not weekdays:
             continue
-        start_gtfs = str(stop_times[0][0])
-        end_gtfs = str(stop_times[-1][0])
-        start_int = gtfs_stop_id_to_int.get(start_gtfs)
-        end_int = gtfs_stop_id_to_int.get(end_gtfs)
-        if start_int is None or end_int is None:
+
+        # Build the list of (internal_stop_id, minutes) for only the stops that survived
+        # the earlier filtering (e.g. dropped invalid coordinates). If the sequence was
+        # A-B-C-D-E and D was dropped, this becomes A-B-C-E and we keep edges
+        # (A,B), (B,C), (C,E).
+        valid_stops: List[tuple[int, int]] = []
+        for sid, mm in stop_times:
+            sid_int = gtfs_stop_id_to_int.get(str(sid))
+            if sid_int is None:
+                continue
+            valid_stops.append((sid_int, int(mm)))
+        if len(valid_stops) < 2:
             continue
-        start_mm = stop_times[0][1]
-        end_mm = stop_times[-1][1]
-        for i in range(len(stop_times) - 1):
-            a_gtfs, b_gtfs = str(stop_times[i][0]), str(stop_times[i + 1][0])
-            if a_gtfs == b_gtfs:
+
+        start_int, start_mm = valid_stops[0]
+        end_int, end_mm = valid_stops[-1]
+
+        # Edges between consecutive valid stops
+        for (a_int, a_mm), (b_int, b_mm) in zip(valid_stops, valid_stops[1:]):
+            if a_int == b_int:
                 continue
-            a_int = gtfs_stop_id_to_int.get(a_gtfs)
-            b_int = gtfs_stop_id_to_int.get(b_gtfs)
-            if a_int is None or b_int is None:
-                continue
-            duration_min = stop_times[i + 1][1] - stop_times[i][1]
+            duration_min = b_mm - a_mm
             key = (a_int, b_int, line_int)
             edge_durations.setdefault(key, []).append(float(duration_min))
         tz_name = trip_to_tz.get(str(trip_id), "UTC")
