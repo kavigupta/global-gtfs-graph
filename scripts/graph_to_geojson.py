@@ -54,20 +54,24 @@ def _default_data_dir() -> Path:
 
 
 def _load_graph(path: Path) -> dict:
-    """Load graph from .pb or .json; return dict with stops, lines, edges (and journeys if present)."""
+    """Load graph from .pb or .json; return dict with stops, lines, edges (derived from journeys when needed)."""
     if path.suffix.lower() == ".pb":
         pb = graph_pb2.FeedGraph()
         pb.ParseFromString(path.read_bytes())
         stops = [{"stop_id": s.stop_id, "name": s.name or "", "lat": s.lat, "lon": s.lon} for s in pb.stops]
         lines = [{"line_id": ln.line_id, "agency_id": getattr(ln, "agency_id", "") or ""} for ln in pb.lines]
-        edges = [
-            {
-                "start_stop_id": e.start_stop_id,
-                "end_stop_id": e.end_stop_id,
-                "line_id": e.line_id,
-            }
-            for e in pb.edges
-        ]
+        # Edges are not stored in the protobuf anymore; derive a simple edge set from journeys.
+        seen = set()
+        edges = []
+        for j in pb.journeys:
+            sid, eid, lid = j.start_stop_id, j.end_stop_id, j.line_id
+            if sid == eid:
+                continue
+            key = (sid, eid, lid)
+            if key in seen:
+                continue
+            seen.add(key)
+            edges.append({"start_stop_id": sid, "end_stop_id": eid, "line_id": lid})
         return {"stops": stops, "lines": lines, "edges": edges}
     data = json.loads(path.read_text())
     assert "stops" in data

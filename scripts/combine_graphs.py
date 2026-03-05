@@ -58,7 +58,12 @@ def _bbox_expand_deg(km: float) -> float:
 
 
 def _load_feed_data(pb_path: Path) -> tuple[graph_pb2.FeedGraph, dict[str, str], dict[tuple[str, str], list[tuple[float, float]]]]:
-    """Load pb, return (pb, line_id_to_agency_id, agency_key -> list of (lat, lon))."""
+    """Load pb, return (pb, line_id_to_agency_id, agency_key -> list of (lat, lon)).
+
+    We no longer rely on precomputed edges in the protobuf; instead we derive a set of
+    representative points per (feed_id, agency_id) from journey start/end stops. This
+    is sufficient for spatial connectivity between agencies.
+    """
     pb = graph_pb2.FeedGraph()
     pb.ParseFromString(pb_path.read_bytes())
     feed_id = pb_path.stem
@@ -69,15 +74,14 @@ def _load_feed_data(pb_path: Path) -> tuple[graph_pb2.FeedGraph, dict[str, str],
         line_to_agency[ln.line_id] = ln.agency_id or ""
 
     agency_stops: dict[tuple[str, str], list[tuple[float, float]]] = {}
-    for e in pb.edges:
-        if e.start_stop_id not in stop_coords or e.end_stop_id not in stop_coords:
-            continue
-        agency_id = line_to_agency.get(e.line_id, "")
+    for j in pb.journeys:
+        agency_id = line_to_agency.get(j.line_id, "")
         key = (feed_id, agency_id)
         if key not in agency_stops:
             agency_stops[key] = []
-        for sid in (e.start_stop_id, e.end_stop_id):
-            agency_stops[key].append(stop_coords[sid])
+        for sid in (j.start_stop_id, j.end_stop_id):
+            if sid in stop_coords:
+                agency_stops[key].append(stop_coords[sid])
 
     # Deduplicate points per agency (same stop can appear in many edges)
     for key in agency_stops:

@@ -136,12 +136,12 @@ def build_feed_graph(
             if (str(sid), wd) not in rep_date:
                 rep_date[(str(sid), wd)] = d
 
-    # (3) Journeys: line_id, start_min, end_min (minutes from week start), int start_stop_id, end_stop_id
-    # (4) Edges: consecutive (start_stop_id, end_stop_id, line_id) with mean_duration_minutes.
+    # (3) Journeys: line_id, start_min, end_min (minutes from week start), int start_stop_id, end_stop_id.
     #     When a stop has been dropped earlier (e.g. invalid coordinates), we skip that stop
     #     but keep the chain by connecting the previous valid stop directly to the next valid one.
+    #     Any explicit edge/segment geometry is computed downstream (e.g. in graph_to_geojson)
+    #     from these journeys and stops; the protobuf no longer carries precomputed edges.
     journey_list: List[Dict[str, Any]] = []
-    edge_durations: Dict[tuple, List[float]] = {}
     for trip_id, service_id, stop_times in trips.compute_trip_stop_times(gtfs):
         if not stop_times:
             continue
@@ -167,14 +167,6 @@ def build_feed_graph(
 
         start_int, start_mm = valid_stops[0]
         end_int, end_mm = valid_stops[-1]
-
-        # Edges between consecutive valid stops
-        for (a_int, a_mm), (b_int, b_mm) in zip(valid_stops, valid_stops[1:]):
-            if a_int == b_int:
-                continue
-            duration_min = b_mm - a_mm
-            key = (a_int, b_int, line_int)
-            edge_durations.setdefault(key, []).append(float(duration_min))
         tz_name = trip_to_tz.get(str(trip_id), "UTC")
         for wd in weekdays:
             rep = rep_date.get((str(service_id), wd))
@@ -190,16 +182,7 @@ def build_feed_graph(
                 "end_stop_id": end_int,
             })
 
-    edges_list = [
-        {
-            "start_stop_id": a,
-            "end_stop_id": b,
-            "line_id": lid,
-            "mean_duration_minutes": sum(durs) / len(durs) if durs else 0.0,
-        }
-        for (a, b, lid), durs in sorted(edge_durations.items())
-    ]
-    return {"stops": stop_list, "lines": line_list, "journeys": journey_list, "edges": edges_list}
+    return {"stops": stop_list, "lines": line_list, "journeys": journey_list}
 
 
 def _payload_to_feed_graph_pb(payload: Dict[str, List[Dict[str, Any]]]) -> bytes:
@@ -225,12 +208,6 @@ def _payload_to_feed_graph_pb(payload: Dict[str, List[Dict[str, Any]]]) -> bytes
         journey.end_min = j.get("end_min", 0)
         journey.start_stop_id = int(j.get("start_stop_id", 0))
         journey.end_stop_id = int(j.get("end_stop_id", 0))
-    for e in payload.get("edges", []):
-        edge = pb.edges.add()
-        edge.start_stop_id = int(e.get("start_stop_id", 0))
-        edge.end_stop_id = int(e.get("end_stop_id", 0))
-        edge.line_id = int(e.get("line_id", 0))
-        edge.mean_duration_minutes = e.get("mean_duration_minutes", 0.0)
     return pb.SerializeToString()
 
 
