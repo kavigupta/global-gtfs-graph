@@ -40,13 +40,19 @@ def render_graph(pb: graph_pb2.FeedGraph, out_path: Path, dpi: int = 150) -> Non
     fig, ax = plt.subplots(figsize=(12, 10))
     ax.set_aspect("equal")
 
-    # Draw edges first (so points sit on top), colored by hash of line name
-    for e in pb.edges:
-        start = stop_coords.get(e.start_stop_id)
-        end = stop_coords.get(e.end_stop_id)
+    # Draw edges first (so points sit on top), colored by hash of line name.
+    # Edges are derived from Journey start/end stops; we ignore timings and days here.
+    seen_edges = set()
+    for j in pb.journeys:
+        key = (j.start_stop_id, j.end_stop_id, j.line_id)
+        if key in seen_edges:
+            continue
+        seen_edges.add(key)
+        start = stop_coords.get(j.start_stop_id)
+        end = stop_coords.get(j.end_stop_id)
         if start is None or end is None:
             continue
-        name = line_id_to_name.get(e.line_id, str(e.line_id))
+        name = line_id_to_name.get(j.line_id, str(j.line_id))
         color = line_name_to_color(name)
         ax.plot([start[0], end[0]], [start[1], end[1]], color=color, linewidth=0.4, alpha=0.8)
 
@@ -98,7 +104,7 @@ def main() -> None:
 
     pb = load_pb_graph(path)
     render_graph(pb, out_path, dpi=args.dpi)
-    print(f"Wrote {out_path} ({len(pb.stops)} stops, {len(pb.edges)} edges)")
+    print(f"Wrote {out_path} ({len(pb.stops)} stops, {len(pb.journeys)} journeys)")
 
 
 if __name__ == "__main__":

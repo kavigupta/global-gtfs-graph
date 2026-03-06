@@ -1,13 +1,15 @@
 """
-Build per-feed graph files: stops (coords + name), journeys (line, times in week minutes, start/end stop),
+Build per-feed graph files: stops (coords + name), journeys (line, local-time patterns between stop pairs),
 and lines (name, color, type_id). Writes data/graphs/<feed_id>.pb (protobuf only).
-Times are normalized to UTC and wrapped into one week (Monday 00:00 UTC).
+
+Journey timings are expressed as:
+- days: weekdays 0–6 (Python weekday, local calendar)
+- timings: minutes from local midnight and duration in minutes.
 """
 
-import datetime
 import re
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set
 
 from . import calendar
 from . import gtfs_io
@@ -45,7 +47,9 @@ def build_feed_graph(
 ) -> Dict[str, List[Dict[str, Any]]]:
     """
     Build the graph payload for one feed: stops, journeys, lines.
-    Uses joined_calendar_dates (cached) to get service_id -> active dates, then weekdays for journeys.
+    Uses joined_calendar_dates (cached) to get service_id -> active dates. Journeys are
+    represented as OD pairs (line_id, start_stop_id, end_stop_id) with per-day departure
+    patterns encoded via days[] and timings[] in UTC.
     """
     # (1) Stops: every stop with normalized int stop_id (0..N-1)
     stops_df = gtfs_io.pull_file_from_gtfs(gtfs, "stops.txt")
@@ -128,20 +132,12 @@ def build_feed_graph(
     for sid, dates in joined.items():
         service_weekdays[str(sid)] = {d.weekday() for d in dates}
 
-    # (service_id, weekday) -> a representative date (for timezone conversion)
-    rep_date: Dict[tuple, datetime.date] = {}
-    for sid, dates in joined.items():
-        for d in dates:
-            wd = d.weekday()
-            if (str(sid), wd) not in rep_date:
-                rep_date[(str(sid), wd)] = d
-
-    # (3) Journeys: line_id, start_min, end_min (minutes from week start), int start_stop_id, end_stop_id.
-    #     When a stop has been dropped earlier (e.g. invalid coordinates), we skip that stop
-    #     but keep the chain by connecting the previous valid stop directly to the next valid one.
-    #     Any explicit edge/segment geometry is computed downstream (e.g. in graph_to_geojson)
-    #     from these journeys and stops; the protobuf no longer carries precomputed edges.
-    journey_list: List[Dict[str, Any]] = []
+    # (3) Journeys:
+    #     One Journey per (line_id, start_stop_id, end_stop_id) with:
+    #     - days: list of local weekdays 0=Monday .. 6=Sunday when that segment runs
+    #     - timings: (start_min local, duration minutes) within the day.
+    #     When a stop was dropped earlier we bridge over it (A-B-C-E).
+    journey_patterns: Dict[tuple[int, int, int], tuple[Set[int], List[tuple[int, int]]]] = {}
     for trip_id, service_id, stop_times in trips.compute_trip_stop_times(gtfs):
         if not stop_times:
             continue
@@ -152,10 +148,6 @@ def build_feed_graph(
         if not weekdays:
             continue
 
-        # Build the list of (internal_stop_id, minutes) for only the stops that survived
-        # the earlier filtering (e.g. dropped invalid coordinates). If the sequence was
-        # A-B-C-D-E and D was dropped, this becomes A-B-C-E and we keep edges
-        # (A,B), (B,C), (C,E).
         valid_stops: List[tuple[int, int]] = []
         for sid, mm in stop_times:
             sid_int = gtfs_stop_id_to_int.get(str(sid))
@@ -166,21 +158,31 @@ def build_feed_graph(
             continue
 
         for (start_int, start_mm), (end_int, end_mm) in zip(valid_stops, valid_stops[1:]):
-
-            tz_name = trip_to_tz.get(str(trip_id), "UTC")
+            key = (line_int, start_int, end_int)
+            if key not in journey_patterns:
+                journey_patterns[key] = (set(), [])
+            days_set, timings_list = journey_patterns[key]
             for wd in weekdays:
-                rep = rep_date.get((str(service_id), wd))
-                if rep is None:
-                    continue
-                start_min = trips.local_minutes_to_week_minutes_utc(rep, start_mm, tz_name)
-                end_min = trips.local_minutes_to_week_minutes_utc(rep, end_mm, tz_name)
-                journey_list.append({
-                    "line_id": line_int,
-                    "start_min": start_min,
-                    "end_min": end_min,
-                    "start_stop_id": start_int,
-                    "end_stop_id": end_int,
-                })
+                # Local calendar weekday and times; we intentionally ignore DST offsets here
+                # and treat all days as having the same local schedule shape.
+                days_set.add(int(wd))
+                duration = end_mm - start_mm
+                timings_list.append((start_mm, duration))
+
+    journey_list: List[Dict[str, Any]] = []
+    for (line_int, start_int, end_int), (days_set, timings_list) in journey_patterns.items():
+        # Weekdays 0-6, dedupe and sort timings
+        days_sorted = sorted(days_set)
+        timings_deduped = sorted(set(timings_list))
+        journey_list.append(
+            {
+                "line_id": line_int,
+                "start_stop_id": start_int,
+                "end_stop_id": end_int,
+                "days": days_sorted,
+                "timings": [{"start_min": sm, "duration": dur} for sm, dur in timings_deduped],
+            }
+        )
 
     # Compact stops: keep only those that are referenced by at least one journey, and
     # renumber stop_id to be dense 0..N-1. Journeys are updated to use the new IDs.
@@ -233,10 +235,14 @@ def _payload_to_feed_graph_pb(payload: Dict[str, List[Dict[str, Any]]]) -> bytes
     for j in payload.get("journeys", []):
         journey = pb.journeys.add()
         journey.line_id = int(j.get("line_id", 0))
-        journey.start_min = j.get("start_min", 0)
-        journey.end_min = j.get("end_min", 0)
         journey.start_stop_id = int(j.get("start_stop_id", 0))
         journey.end_stop_id = int(j.get("end_stop_id", 0))
+        for d in j.get("days", []):
+            journey.days.append(int(d))
+        for t in j.get("timings", []):
+            timing = journey.timings.add()
+            timing.start_min = int(t.get("start_min", 0))
+            timing.duration = int(t.get("duration", 0))
     return pb.SerializeToString()
 
 
@@ -246,6 +252,7 @@ def write_feed_graph(
     base: Path = DEFAULT_DATA_DIR,
 ) -> Path:
     """Build the graph for this feed and write data/graphs/<feed_id>.pb. Returns path written."""
+    print(f"Building graph for feed {feed_id}")
     payload = build_feed_graph(gtfs, feed_id=feed_id, base=base)
     out_pb = _graph_pb_path(feed_id, base)
     out_pb.parent.mkdir(parents=True, exist_ok=True)

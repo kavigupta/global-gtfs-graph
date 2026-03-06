@@ -2,10 +2,10 @@
 Export all per-feed graphs into per-component shapefiles packaged as .zips.
 
 - Points: one shapefile per component with all stops from feeds in that component
-  - Filenames: component_<idx>_points.zip
+  - Output: data/geojson/components/component_<idx>_points.zip
   - Attributes: stop_id, name, feed_id, component (connected-component index)
 - Lines: one shapefile per component with one MultiLineString per agency in that component
-  - Filenames: component_<idx>_lines.zip
+  - Output: data/geojson/components/component_<idx>_lines.zip
   - Attributes: agency_id
 
 Connected components (the `component` field) are read from data/connected_components.json,
@@ -209,7 +209,7 @@ def main():
             agency_id = line_to_agency.get(e.line_id, "") or ""
             segs_for_comp.setdefault(agency_id, []).append((c1, c2))
 
-    out_dir = base / "geojson"
+    out_dir = base / "geojson" / "components"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if not points_by_comp:
