@@ -75,11 +75,13 @@ def _load_feed_data(pb_path: Path) -> tuple[graph_pb2.FeedGraph, dict[str, str],
 
     agency_stops: dict[tuple[str, str], list[tuple[float, float]]] = {}
     for j in pb.journeys:
+        if not j.stops:
+            continue
         agency_id = line_to_agency.get(j.line_id, "")
         key = (feed_id, agency_id)
         if key not in agency_stops:
             agency_stops[key] = []
-        for sid in (j.start_stop_id, j.end_stop_id):
+        for sid in (j.stops[0], j.stops[-1]):
             if sid in stop_coords:
                 agency_stops[key].append(stop_coords[sid])
 

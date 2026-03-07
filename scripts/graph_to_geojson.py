@@ -60,18 +60,20 @@ def _load_graph(path: Path) -> dict:
         pb.ParseFromString(path.read_bytes())
         stops = [{"stop_id": s.stop_id, "name": s.name or "", "lat": s.lat, "lon": s.lon} for s in pb.stops]
         lines = [{"line_id": ln.line_id, "agency_id": getattr(ln, "agency_id", "") or ""} for ln in pb.lines]
-        # Edges are not stored in the protobuf anymore; derive a simple edge set from journeys.
+        # Derive edges from full journeys: consecutive stop pairs in each journey.
         seen = set()
         edges = []
         for j in pb.journeys:
-            sid, eid, lid = j.start_stop_id, j.end_stop_id, j.line_id
-            if sid == eid:
-                continue
-            key = (sid, eid, lid)
-            if key in seen:
-                continue
-            seen.add(key)
-            edges.append({"start_stop_id": sid, "end_stop_id": eid, "line_id": lid})
+            lid = j.line_id
+            for i in range(len(j.stops) - 1):
+                sid, eid = j.stops[i], j.stops[i + 1]
+                if sid == eid:
+                    continue
+                key = (sid, eid, lid)
+                if key in seen:
+                    continue
+                seen.add(key)
+                edges.append({"start_stop_id": sid, "end_stop_id": eid, "line_id": lid})
         return {"stops": stops, "lines": lines, "edges": edges}
     data = json.loads(path.read_text())
     assert "stops" in data
@@ -80,11 +82,13 @@ def _load_graph(path: Path) -> dict:
         seen = set()
         edges = []
         for j in data["journeys"]:
-            sid, eid = j["start_stop_id"], j["end_stop_id"]
+            stops_seq = j.get("stops", [])
             lid = j.get("line_id", "")
-            if sid != eid and (sid, eid, lid) not in seen:
-                seen.add((sid, eid, lid))
-                edges.append({"start_stop_id": sid, "end_stop_id": eid, "line_id": lid})
+            for i in range(len(stops_seq) - 1):
+                sid, eid = stops_seq[i], stops_seq[i + 1]
+                if sid != eid and (sid, eid, lid) not in seen:
+                    seen.add((sid, eid, lid))
+                    edges.append({"start_stop_id": sid, "end_stop_id": eid, "line_id": lid})
     return {"stops": data["stops"], "lines": data.get("lines", []), "edges": edges or []}
 
 
@@ -198,16 +202,17 @@ def main():
             pts["feed_id"].append(feed_id)
             pts["component"].append(component)
 
-        # Lines: group segments by agency_id within this component
+        # Lines: derive segments from journeys (consecutive stops), group by agency_id
         segs_for_comp = segments_by_comp.setdefault(component, {})
         line_to_agency = {ln.line_id: (ln.agency_id or "") for ln in pb.lines}
-        for e in pb.edges:
-            c1 = stop_coords.get(e.start_stop_id)
-            c2 = stop_coords.get(e.end_stop_id)
-            if c1 is None or c2 is None:
-                continue
-            agency_id = line_to_agency.get(e.line_id, "") or ""
-            segs_for_comp.setdefault(agency_id, []).append((c1, c2))
+        for j in pb.journeys:
+            agency_id = line_to_agency.get(j.line_id, "") or ""
+            for i in range(len(j.stops) - 1):
+                c1 = stop_coords.get(j.stops[i])
+                c2 = stop_coords.get(j.stops[i + 1])
+                if c1 is None or c2 is None:
+                    continue
+                segs_for_comp.setdefault(agency_id, []).append((c1, c2))
 
     out_dir = base / "geojson" / "components"
     out_dir.mkdir(parents=True, exist_ok=True)

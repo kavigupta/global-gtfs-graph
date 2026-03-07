@@ -41,20 +41,22 @@ def render_graph(pb: graph_pb2.FeedGraph, out_path: Path, dpi: int = 150) -> Non
     ax.set_aspect("equal")
 
     # Draw edges first (so points sit on top), colored by hash of line name.
-    # Edges are derived from Journey start/end stops; we ignore timings and days here.
+    # Edges are derived from consecutive stops in each journey.
     seen_edges = set()
     for j in pb.journeys:
-        key = (j.start_stop_id, j.end_stop_id, j.line_id)
-        if key in seen_edges:
-            continue
-        seen_edges.add(key)
-        start = stop_coords.get(j.start_stop_id)
-        end = stop_coords.get(j.end_stop_id)
-        if start is None or end is None:
-            continue
-        name = line_id_to_name.get(j.line_id, str(j.line_id))
-        color = line_name_to_color(name)
-        ax.plot([start[0], end[0]], [start[1], end[1]], color=color, linewidth=0.4, alpha=0.8)
+        for i in range(len(j.stops) - 1):
+            a, b = j.stops[i], j.stops[i + 1]
+            key = (a, b, j.line_id)
+            if key in seen_edges:
+                continue
+            seen_edges.add(key)
+            start = stop_coords.get(a)
+            end = stop_coords.get(b)
+            if start is None or end is None:
+                continue
+            name = line_id_to_name.get(j.line_id, str(j.line_id))
+            color = line_name_to_color(name)
+            ax.plot([start[0], end[0]], [start[1], end[1]], color=color, linewidth=0.4, alpha=0.8)
 
     # Draw stops as black points
     lons = [s.lon for s in pb.stops]
