@@ -18,6 +18,7 @@ import numpy as np
 import networkx as nx
 import tqdm
 
+from global_gtfs_graph import geo
 from global_gtfs_graph import graph_pb2
 
 NEAREST_STOP_KM = 20.0
@@ -29,16 +30,6 @@ def _default_data_dir() -> Path:
     return Path(__file__).resolve().parent.parent / "data"
 
 
-def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Distance in km between (lat1,lon1) and (lat2,lon2)."""
-    R = 6371.0
-    phi1, phi2 = np.deg2rad(lat1), np.deg2rad(lat2)
-    dphi = np.deg2rad(lat2 - lat1)
-    dlam = np.deg2rad(lon2 - lon1)
-    a = np.sin(dphi / 2) ** 2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlam / 2) ** 2
-    return 2 * R * np.arcsin(np.sqrt(np.minimum(1.0, a)))
-
-
 def _min_distance_km(stops_a: list[tuple[float, float]], stops_b: list[tuple[float, float]]) -> float:
     """Minimum distance in km between any point in stops_a and any in stops_b."""
     if not stops_a or not stops_b:
@@ -46,7 +37,7 @@ def _min_distance_km(stops_a: list[tuple[float, float]], stops_b: list[tuple[flo
     best = float("inf")
     for (la, loa) in stops_a:
         for (lb, lob) in stops_b:
-            d = _haversine_km(la, loa, lb, lob)
+            d = geo.haversine_km(la, loa, lb, lob)
             if d < best:
                 best = d
     return best
@@ -105,11 +96,11 @@ def _connected_components(
 ) -> list[list[tuple[str, str]]]:
     agency_stops = {k: np.array(v) for k, v in agency_stops.items()}
     mean_each = {k: np.mean(v, axis=0) for k, v in agency_stops.items()}
-    radii_each = {k: _haversine_km(mean_each[k][0], mean_each[k][1], agency_stops[k][:, 0], agency_stops[k][:, 1]).max() for k in agency_stops}
+    radii_each = {k: geo.haversine_km(mean_each[k][0], mean_each[k][1], agency_stops[k][:, 0], agency_stops[k][:, 1]).max() for k in agency_stops}
     keys = sorted(agency_stops)
     radii_each = np.array([radii_each[k] for k in keys])
     mean_each = np.array([mean_each[k] for k in keys])
-    distance_matrix = _haversine_km(mean_each[:, 0][None], mean_each[:, 1][None], mean_each[:, 0][:, None], mean_each[:, 1][:, None])
+    distance_matrix = geo.haversine_km(mean_each[:, 0][None], mean_each[:, 1][None], mean_each[:, 0][:, None], mean_each[:, 1][:, None])
     minimum_distance_matrix = distance_matrix - (radii_each[:, None] + radii_each[None, :])
     edges = []
     for i, j in tqdm.tqdm(list(zip(*np.where(minimum_distance_matrix < max_km)))):
@@ -117,7 +108,7 @@ def _connected_components(
             continue
         i, j = keys[i], keys[j]
         a, b = agency_stops[i], agency_stops[j]
-        dist = _haversine_km(a[:, 0][None], a[:, 1][None], b[:, 0][:, None], b[:, 1][:, None]).min()
+        dist = geo.haversine_km(a[:, 0][None], a[:, 1][None], b[:, 0][:, None], b[:, 1][:, None]).min()
         # print(i, j, dist)
         if dist < max_km:
             edges.append((i, j, dist))
