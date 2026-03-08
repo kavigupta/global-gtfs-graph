@@ -1,128 +1,46 @@
 """
-Compute connected components of agencies based on spatial proximity and write
-the result to data/connected_components.json (no combined graph .pb files).
+Load all data/graphs/*.pb (excluding graphs_all*), combine into a single graph with
+universal stop and line indices, run point deduplication (reduce_points), then write
+to data/combined_graphs/:
 
-Two agencies are connected if their nearest stops are less than 20 km apart (Haversine).
-Agency = (feed_id, agency_id).
+- graphs_all_structures.pb: lines and any other non-bulk structures (no stops/journeys).
+- graphs_all_stops_<i>.pb: stops in chunks of MAX_PER_FILE (1M) to stay under protobuf limits.
+- graphs_all_journeys_<i>.pb: journeys in chunks of MAX_PER_FILE (1M).
 
-Usage (from repo root):
-    python scripts/combine_graphs.py
+Uses flat arrays + offsets for journeys to avoid memory-heavy list-of-dicts.
 """
 
-import json
-import math
-import random
+from __future__ import annotations
+
 from pathlib import Path
-from collections import deque
+
 import numpy as np
-import networkx as nx
 import tqdm
 
-from global_gtfs_graph import geo
 from global_gtfs_graph import graph_pb2
+from global_gtfs_graph.point_reduce import reduce_points
 
-NEAREST_STOP_KM = 20.0
-# Max points per agency used for connectivity (sample if more) to keep component step fast
-MAX_POINTS_PER_AGENCY_FOR_CONNECTIVITY = 200
+MAX_PER_FILE = 1_000_000
+DEDUP_MAX_DISTANCE_M = 25.0
+# In-place remap chunk size to avoid temporary allocation
+_REMAP_CHUNK = 5_000_000
 
 
 def _default_data_dir() -> Path:
     return Path(__file__).resolve().parent.parent / "data"
 
 
-def _min_distance_km(stops_a: list[tuple[float, float]], stops_b: list[tuple[float, float]]) -> float:
-    """Minimum distance in km between any point in stops_a and any in stops_b."""
-    if not stops_a or not stops_b:
-        return float("inf")
-    best = float("inf")
-    for (la, loa) in stops_a:
-        for (lb, lob) in stops_b:
-            d = geo.haversine_km(la, loa, lb, lob)
-            if d < best:
-                best = d
-    return best
-
-
-def _bbox_expand_deg(km: float) -> float:
-    """Approximate degrees for km at mid-latitudes (for bbox filter)."""
-    return (km / 111.0)  # 1 deg ~ 111 km
-
-
-def _load_feed_data(pb_path: Path) -> tuple[graph_pb2.FeedGraph, dict[str, str], dict[tuple[str, str], list[tuple[float, float]]]]:
-    """Load pb, return (pb, line_id_to_agency_id, agency_key -> list of (lat, lon)).
-
-    We no longer rely on precomputed edges in the protobuf; instead we derive a set of
-    representative points per (feed_id, agency_id) from journey start/end stops. This
-    is sufficient for spatial connectivity between agencies.
-    """
+def _load_feed_pb(pb_path: Path) -> graph_pb2.FeedGraph:
     pb = graph_pb2.FeedGraph()
     pb.ParseFromString(pb_path.read_bytes())
-    feed_id = pb_path.stem
-
-    stop_coords: dict[int, tuple[float, float]] = {s.stop_id: (s.lat, s.lon) for s in pb.stops}
-    line_to_agency: dict[str, str] = {}
-    for ln in pb.lines:
-        line_to_agency[ln.line_id] = ln.agency_id or ""
-
-    agency_stops: dict[tuple[str, str], list[tuple[float, float]]] = {}
-    for j in pb.journeys:
-        if not j.stops:
-            continue
-        agency_id = line_to_agency.get(j.line_id, "")
-        key = (feed_id, agency_id)
-        if key not in agency_stops:
-            agency_stops[key] = []
-        for sid in (j.stops[0], j.stops[-1]):
-            if sid in stop_coords:
-                agency_stops[key].append(stop_coords[sid])
-
-    # Deduplicate points per agency (same stop can appear in many edges)
-    for key in agency_stops:
-        seen: set[tuple[float, float]] = set()
-        unique = []
-        for p in agency_stops[key]:
-            if p not in seen:
-                seen.add(p)
-                unique.append(p)
-        agency_stops[key] = unique
-
-    return pb, line_to_agency, agency_stops
+    return pb
 
 
-def _connected_components(
-    nodes: list[tuple[str, str]],
-    agency_stops: dict[tuple[str, str], list[tuple[float, float]]],
-    max_km: float,
-) -> list[list[tuple[str, str]]]:
-    agency_stops = {k: np.array(v) for k, v in agency_stops.items()}
-    mean_each = {k: np.mean(v, axis=0) for k, v in agency_stops.items()}
-    radii_each = {k: geo.haversine_km(mean_each[k][0], mean_each[k][1], agency_stops[k][:, 0], agency_stops[k][:, 1]).max() for k in agency_stops}
-    keys = sorted(agency_stops)
-    radii_each = np.array([radii_each[k] for k in keys])
-    mean_each = np.array([mean_each[k] for k in keys])
-    distance_matrix = geo.haversine_km(mean_each[:, 0][None], mean_each[:, 1][None], mean_each[:, 0][:, None], mean_each[:, 1][:, None])
-    minimum_distance_matrix = distance_matrix - (radii_each[:, None] + radii_each[None, :])
-    edges = []
-    for i, j in tqdm.tqdm(list(zip(*np.where(minimum_distance_matrix < max_km)))):
-        if i >= j:
-            continue
-        i, j = keys[i], keys[j]
-        a, b = agency_stops[i], agency_stops[j]
-        dist = geo.haversine_km(a[:, 0][None], a[:, 1][None], b[:, 0][:, None], b[:, 1][:, None]).min()
-        # print(i, j, dist)
-        if dist < max_km:
-            edges.append((i, j, dist))
-    G = nx.Graph()
-    G.add_edges_from([(x, y) for x, y, _ in edges])
-    components = list(nx.connected_components(G))
-    return components
-
-
-def combine_graphs(base: Path | None = None) -> Path:
+def combine_graphs(base: Path | None = None) -> list[Path]:
     """
-    Load all data/graphs/*.pb, partition agencies by connected components (nearest stops < 20 km),
-    and write data/connected_components.json with the list of feeds per component.
-    Returns the path written.
+    Load all feed .pb files, merge into one graph with universal indices,
+    run point deduplication, then write chunked protobufs.
+    Returns list of paths written.
     """
     if base is None:
         base = _default_data_dir()
@@ -130,61 +48,192 @@ def combine_graphs(base: Path | None = None) -> Path:
     if not graphs_dir.exists():
         raise SystemExit(f"Graphs directory not found: {graphs_dir}")
 
-    pb_files = sorted(p for p in graphs_dir.glob("*.pb") if not p.name.startswith("graphs_all"))
+    out_dir = base / "combined_graphs"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    pb_files = sorted(
+        p for p in graphs_dir.glob("*.pb") if not p.name.startswith("graphs_all")
+    )
     if not pb_files:
         raise SystemExit(f"No .pb graph files found under {graphs_dir}")
 
-    # Load all feeds and collect agency -> stops
-    feed_pbs: dict[str, graph_pb2.FeedGraph] = {}
-    feed_line_to_agency: dict[str, dict[int, str]] = {}
-    all_agency_stops: dict[tuple[str, str], list[tuple[float, float]]] = {}
+    # --- 1. Combine: flat arrays for stops; lines as list (small); journeys as flat + offsets ---
+    lat_list: list[float] = []
+    lon_list: list[float] = []
+    stop_names: list[str] = []
 
-    for pb_path in pb_files:
-        feed_id = pb_path.stem
-        pb, line_to_agency, agency_stops = _load_feed_data(pb_path)
-        feed_pbs[feed_id] = pb
-        feed_line_to_agency[feed_id] = line_to_agency
-        for key, pts in agency_stops.items():
-            all_agency_stops[key] = all_agency_stops.get(key, []) + pts
+    lines: list[dict] = []  # {line_id, name, color, type_id, agency_id} — small
 
-    # Deduplicate points per agency again (across feeds we only had per-feed; same agency key can appear in one feed only)
-    nodes = list(all_agency_stops.keys())
-    # Sample points per agency so component computation stays tractable
-    sampled: dict[tuple[str, str], list[tuple[float, float]]] = {}
-    for key, pts in all_agency_stops.items():
-        if len(pts) <= MAX_POINTS_PER_AGENCY_FOR_CONNECTIVITY:
-            sampled[key] = pts
-        else:
-            sampled[key] = random.sample(pts, MAX_POINTS_PER_AGENCY_FOR_CONNECTIVITY)
-    print(f"Computing connected components for {len(nodes)} agencies (edge if nearest stops < {NEAREST_STOP_KM} km)...")
-    components = _connected_components(nodes, sampled, NEAREST_STOP_KM)
-    print(f"Found {len(components)} component(s).")
+    journey_line_ids: list[int] = []
+    stops_flat_list: list[int] = []
+    stops_offsets: list[int] = [0]
+    times_flat_list: list[int] = []
+    times_offsets: list[int] = [0]
+    days_flat_list: list[int] = []
+    days_offsets: list[int] = [0]
 
-    # For each component, collect the set of feeds it contains.
-    components_feeds: list[list[str]] = []
-    for comp in components:
-        feeds_in_comp = sorted({feed_id for feed_id, _ in comp})
-        components_feeds.append(feeds_in_comp)
+    next_stop_id = 0
+    next_line_id = 0
 
-    out_path = base / "connected_components.json"
-    out_path.write_text(
-        json.dumps(
-            {
-                "nearest_stop_km": NEAREST_STOP_KM,
-                "components": components_feeds,
-            },
-            indent=2,
+    for pb_path in tqdm.tqdm(pb_files, desc="Loading feeds"):
+        pb = _load_feed_pb(pb_path)
+        feed_stop_to_global: dict[int, int] = {}
+        feed_line_to_global: dict[int, int] = {}
+
+        for s in pb.stops:
+            gid = next_stop_id
+            next_stop_id += 1
+            feed_stop_to_global[s.stop_id] = gid
+            lat_list.append(s.lat)
+            lon_list.append(s.lon)
+            stop_names.append(s.name or "")
+
+        for ln in pb.lines:
+            gid = next_line_id
+            next_line_id += 1
+            feed_line_to_global[ln.line_id] = gid
+            lines.append({
+                "line_id": gid,
+                "name": ln.name or "",
+                "color": ln.color or "",
+                "type_id": int(ln.type_id),
+                "agency_id": ln.agency_id or "",
+            })
+
+        for j in pb.journeys:
+            if len(j.stops) < 2:
+                continue
+            global_stops = [feed_stop_to_global[sid] for sid in j.stops if sid in feed_stop_to_global]
+            if len(global_stops) < 2:
+                continue
+            line_id = feed_line_to_global.get(j.line_id, 0)
+            journey_line_ids.append(line_id)
+            stops_flat_list.extend(global_stops)
+            stops_offsets.append(len(stops_flat_list))
+            times_flat_list.extend(int(t) for t in j.times_within_day)
+            times_offsets.append(len(times_flat_list))
+            days_flat_list.extend(int(d) for d in j.days)
+            days_offsets.append(len(days_flat_list))
+
+    n_stops = len(lat_list)
+    n_lines = len(lines)
+    n_journeys = len(journey_line_ids)
+    print(f"Combined: {n_stops} stops, {n_lines} lines, {n_journeys} journeys")
+
+    # Convert to numpy only what we need for dedup; drop list copies as we go
+    lat = np.array(lat_list, dtype=np.float64)
+    lon = np.array(lon_list, dtype=np.float64)
+    del lat_list, lon_list
+
+    # --- 2. Point deduplication ---
+    if n_stops == 0:
+        raise SystemExit("No stops to write.")
+    with tqdm.tqdm(
+        desc="Running point deduplication",
+        total=1,
+        unit="",
+        bar_format="{desc}: {n_fmt}/{total_fmt} [{elapsed}]",
+    ) as pbar:
+        new_lat, new_lon, mapping = reduce_points(
+            lat, lon, max_distance_m=DEDUP_MAX_DISTANCE_M
         )
-    )
-    return out_path
+        pbar.update(1)
+    M = len(new_lat)
+    print(f"After dedup: {M} representative stops (from {n_stops})")
+    del lat, lon
+
+    # Representative name = first original name mapping to that rep
+    rep_names: list[str] = [""] * M
+    for old_id in range(n_stops):
+        r = int(mapping[old_id])
+        if not rep_names[r]:
+            rep_names[r] = stop_names[old_id]
+    del stop_names
+
+    # Flat journey arrays; remap stop ids in place
+    line_ids_arr = np.array(journey_line_ids, dtype=np.int32)
+    del journey_line_ids
+    stops_flat = np.array(stops_flat_list, dtype=np.int32)
+    del stops_flat_list
+    stops_offsets_arr = np.array(stops_offsets, dtype=np.int64)
+    del stops_offsets
+    times_flat = np.array(times_flat_list, dtype=np.int32)
+    del times_flat_list
+    times_offsets_arr = np.array(times_offsets, dtype=np.int64)
+    del times_offsets
+    days_flat = np.array(days_flat_list, dtype=np.int32)
+    del days_flat_list
+    days_offsets_arr = np.array(days_offsets, dtype=np.int64)
+    del days_offsets
+
+    # Remap stop ids in place (chunked to avoid big temporary)
+    mapping = np.asarray(mapping, dtype=np.int32)
+    for start in range(0, len(stops_flat), _REMAP_CHUNK):
+        end = min(start + _REMAP_CHUNK, len(stops_flat))
+        stops_flat[start:end] = mapping[stops_flat[start:end]]
+
+    # --- 3. Write chunked protobufs ---
+    written: list[Path] = []
+
+    # Structures: lines only
+    structures_pb = graph_pb2.FeedGraph()
+    for ln in lines:
+        line = structures_pb.lines.add()
+        line.line_id = ln["line_id"]
+        line.name = ln["name"]
+        line.color = ln["color"]
+        line.type_id = ln["type_id"]
+        line.agency_id = ln["agency_id"]
+    structures_path = out_dir / "graphs_all_structures.pb"
+    structures_path.write_bytes(structures_pb.SerializeToString())
+    written.append(structures_path)
+
+    # Stops: stream by chunk from arrays (no list of dicts)
+    for chunk_start in range(0, M, MAX_PER_FILE):
+        chunk_end = min(chunk_start + MAX_PER_FILE, M)
+        pb = graph_pb2.FeedGraph()
+        for i in range(chunk_start, chunk_end):
+            stop = pb.stops.add()
+            stop.stop_id = i
+            stop.name = rep_names[i]
+            stop.lat = float(new_lat[i])
+            stop.lon = float(new_lon[i])
+        idx = chunk_start // MAX_PER_FILE
+        path = out_dir / f"graphs_all_stops_{idx}.pb"
+        path.write_bytes(pb.SerializeToString())
+        written.append(path)
+    print(f"Wrote {((M - 1) // MAX_PER_FILE) + 1} stop chunk(s)")
+    del new_lat, new_lon, rep_names
+
+    # Journeys: stream by chunk from flat arrays
+    for chunk_start in range(0, n_journeys, MAX_PER_FILE):
+        chunk_end = min(chunk_start + MAX_PER_FILE, n_journeys)
+        pb = graph_pb2.FeedGraph()
+        for j in range(chunk_start, chunk_end):
+            journey = pb.journeys.add()
+            journey.line_id = int(line_ids_arr[j])
+            s0, s1 = int(stops_offsets_arr[j]), int(stops_offsets_arr[j + 1])
+            for s in stops_flat[s0:s1]:
+                journey.stops.append(int(s))
+            t0, t1 = int(times_offsets_arr[j]), int(times_offsets_arr[j + 1])
+            for t in times_flat[t0:t1]:
+                journey.times_within_day.append(int(t))
+            d0, d1 = int(days_offsets_arr[j]), int(days_offsets_arr[j + 1])
+            for d in days_flat[d0:d1]:
+                journey.days.append(int(d))
+        idx = chunk_start // MAX_PER_FILE
+        path = out_dir / f"graphs_all_journeys_{idx}.pb"
+        path.write_bytes(pb.SerializeToString())
+        written.append(path)
+    print(f"Wrote {((n_journeys - 1) // MAX_PER_FILE) + 1} journey chunk(s)")
+
+    return written
 
 
 def main() -> None:
     base = _default_data_dir()
-    out_path = combine_graphs(base)
-    print(
-        f"Wrote connected components (by agencies linked if nearest stops < {NEAREST_STOP_KM} km) to {out_path}"
-    )
+    written = combine_graphs(base)
+    print(f"Wrote {len(written)} file(s) under {base / 'combined_graphs'}.")
 
 
 if __name__ == "__main__":
