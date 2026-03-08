@@ -20,6 +20,7 @@ from typing import Dict, List, Tuple
 
 import networkx as nx
 import numpy as np
+import tqdm.auto as tqdm
 
 from . import geo
 
@@ -77,7 +78,9 @@ def build_proximity_graph(
     grid = {k: np.array(v, dtype=np.int64) for k, v in grid.items()}
 
     # Per cell: vectorized haversine between points in this cell and points in neighbor cells.
-    for (ci, cj), I_arr in grid.items():
+    for (ci, cj), I_arr in tqdm.tqdm(
+        grid.items(), desc="Building proximity graph", unit="cell", total=len(grid)
+    ):
         if I_arr.size == 0:
             continue
 
@@ -142,7 +145,9 @@ def reduce_points(
     G = build_proximity_graph(lat, lon, link_radius_m=2.0 * max_distance_m)
 
     rep_global = np.arange(n, dtype=np.int64)
-    is_cluster_rep = np.zeros(n, dtype=bool)  # True if this node's position was overwritten as a centroid
+    is_cluster_rep = np.zeros(
+        n, dtype=bool
+    )  # True if this node's position was overwritten as a centroid
 
     def centroid_for_cluster(cluster_idxs):
         return lat_rad[cluster_idxs].mean(), lon_rad[cluster_idxs].mean()
@@ -177,7 +182,7 @@ def reduce_points(
     deg = dict(G.degree())
     nodes_by_degree = sorted(G.nodes(), key=lambda u: deg[u], reverse=True)
 
-    for u in nodes_by_degree:
+    for u in tqdm.tqdm(nodes_by_degree, desc="Greedy clustering", unit="node"):
         if u not in G:
             continue
 
@@ -197,7 +202,9 @@ def reduce_points(
             rep_global[c] = new_idx
             # Remove node c and connect new_idx to nodes within 2*max_distance_m.
             neighbors = list(G.neighbors(c))
-            candidates = set(neighbors) | {v for nb in neighbors for v in G.neighbors(nb)}
+            candidates = set(neighbors) | {
+                v for nb in neighbors for v in G.neighbors(nb)
+            }
             for v in candidates:
                 if (
                     v != new_idx
