@@ -1,7 +1,6 @@
 """
 Load all data/graphs/*.pb (excluding graphs_all*), combine into a single graph with
-universal stop and line indices, run point deduplication (reduce_points), then write
-to data/combined_graphs/:
+universal stop and line indices, then write to data/combined_graphs/:
 
 - graphs_all_structures.pb: lines and any other non-bulk structures (no stops/journeys).
 - graphs_all_stops_<i>.pb: stops in chunks of MAX_PER_FILE (1M) to stay under protobuf limits.
@@ -18,12 +17,8 @@ import numpy as np
 import tqdm
 
 from global_gtfs_graph import graph_pb2
-from global_gtfs_graph.point_reduce import reduce_points
 
 MAX_PER_FILE = 1_000_000
-DEDUP_MAX_DISTANCE_M = 25.0
-# In-place remap chunk size to avoid temporary allocation
-_REMAP_CHUNK = 5_000_000
 
 
 def _default_data_dir() -> Path:
@@ -39,7 +34,7 @@ def _load_feed_pb(pb_path: Path) -> graph_pb2.FeedGraph:
 def combine_graphs(base: Path | None = None) -> list[Path]:
     """
     Load all feed .pb files, merge into one graph with universal indices,
-    run point deduplication, then write chunked protobufs.
+    then write chunked protobufs.
     Returns list of paths written.
     """
     if base is None:
@@ -120,37 +115,11 @@ def combine_graphs(base: Path | None = None) -> list[Path]:
     n_journeys = len(journey_line_ids)
     print(f"Combined: {n_stops} stops, {n_lines} lines, {n_journeys} journeys")
 
-    # Convert to numpy only what we need for dedup; drop list copies as we go
+    # Convert to numpy for writing; drop list copies as we go
     lat = np.array(lat_list, dtype=np.float64)
     lon = np.array(lon_list, dtype=np.float64)
     del lat_list, lon_list
 
-    # --- 2. Point deduplication ---
-    if n_stops == 0:
-        raise SystemExit("No stops to write.")
-    with tqdm.tqdm(
-        desc="Running point deduplication",
-        total=1,
-        unit="",
-        bar_format="{desc}: {n_fmt}/{total_fmt} [{elapsed}]",
-    ) as pbar:
-        new_lat, new_lon, mapping = reduce_points(
-            lat, lon, max_distance_m=DEDUP_MAX_DISTANCE_M
-        )
-        pbar.update(1)
-    M = len(new_lat)
-    print(f"After dedup: {M} representative stops (from {n_stops})")
-    del lat, lon
-
-    # Representative name = first original name mapping to that rep
-    rep_names: list[str] = [""] * M
-    for old_id in range(n_stops):
-        r = int(mapping[old_id])
-        if not rep_names[r]:
-            rep_names[r] = stop_names[old_id]
-    del stop_names
-
-    # Flat journey arrays; remap stop ids in place
     line_ids_arr = np.array(journey_line_ids, dtype=np.int32)
     del journey_line_ids
     stops_flat = np.array(stops_flat_list, dtype=np.int32)
@@ -166,13 +135,7 @@ def combine_graphs(base: Path | None = None) -> list[Path]:
     days_offsets_arr = np.array(days_offsets, dtype=np.int64)
     del days_offsets
 
-    # Remap stop ids in place (chunked to avoid big temporary)
-    mapping = np.asarray(mapping, dtype=np.int32)
-    for start in range(0, len(stops_flat), _REMAP_CHUNK):
-        end = min(start + _REMAP_CHUNK, len(stops_flat))
-        stops_flat[start:end] = mapping[stops_flat[start:end]]
-
-    # --- 3. Write chunked protobufs ---
+    # --- 2. Write chunked protobufs ---
     written: list[Path] = []
 
     # Structures: lines only
@@ -188,22 +151,21 @@ def combine_graphs(base: Path | None = None) -> list[Path]:
     structures_path.write_bytes(structures_pb.SerializeToString())
     written.append(structures_path)
 
-    # Stops: stream by chunk from arrays (no list of dicts)
-    for chunk_start in range(0, M, MAX_PER_FILE):
-        chunk_end = min(chunk_start + MAX_PER_FILE, M)
+    # Stops: stream by chunk from arrays
+    for chunk_start in range(0, n_stops, MAX_PER_FILE):
+        chunk_end = min(chunk_start + MAX_PER_FILE, n_stops)
         pb = graph_pb2.FeedGraph()
         for i in range(chunk_start, chunk_end):
             stop = pb.stops.add()
             stop.stop_id = i
-            stop.name = rep_names[i]
-            stop.lat = float(new_lat[i])
-            stop.lon = float(new_lon[i])
+            stop.name = stop_names[i]
+            stop.lat = float(lat[i])
+            stop.lon = float(lon[i])
         idx = chunk_start // MAX_PER_FILE
         path = out_dir / f"graphs_all_stops_{idx}.pb"
         path.write_bytes(pb.SerializeToString())
         written.append(path)
-    print(f"Wrote {((M - 1) // MAX_PER_FILE) + 1} stop chunk(s)")
-    del new_lat, new_lon, rep_names
+    print(f"Wrote {((n_stops - 1) // MAX_PER_FILE) + 1} stop chunk(s)")
 
     # Journeys: stream by chunk from flat arrays
     for chunk_start in range(0, n_journeys, MAX_PER_FILE):
