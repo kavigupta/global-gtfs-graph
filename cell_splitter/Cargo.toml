@@ -1,0 +1,15 @@
+[package]
+name = "global_gtfs_graph"
+version = "0.1.0"
+edition = "2021"
+description = "Split combined GTFS graph into 1x1 degree cells with transit + walking"
+
+[dependencies]
+prost = "0.13"
+rstar = "0.12"
+thiserror = "2"
+anyhow = "1"
+indicatif = "0.17"
+
+[build-dependencies]
+prost-build = "0.13"
